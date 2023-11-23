@@ -912,7 +912,7 @@ struct file {
 	struct hlist_node f_hash;
 #endif /* #ifdef CONFIG_FILE_TABLE_DEBUG */
 } __randomize_layout
-  __attribute__((aligned(4)));	/* lest something weird decides that 2 is OK */
+  __attribute__((aligned(8)));
 
 struct file_handle {
 	__u32 handle_bytes;
@@ -1687,6 +1687,13 @@ extern struct dentry *vfs_tmpfile(struct vfsmount *mnt,
 				  struct dentry *dentry, umode_t mode,
 				  int open_flag);
 
+#ifdef CONFIG_COMPAT
+extern long compat_ptr_ioctl(struct file *file, unsigned int cmd,
+					unsigned long arg);
+#else
+#define compat_ptr_ioctl NULL
+#endif
+
 /*
  * VFS file helper functions.
  */
@@ -1809,6 +1816,7 @@ struct file_operations {
 			u64);
 	ssize_t (*dedupe_file_range)(struct file *, u64, u64, struct file *,
 			u64);
+	int (*fadvise)(struct file *, loff_t, loff_t, int);
 } __randomize_layout;
 
 struct inode_operations {
@@ -3572,5 +3580,9 @@ static inline int inode_drain_writes(struct inode *inode)
 	inode_dio_wait(inode);
 	return filemap_write_and_wait(inode->i_mapping);
 }
+
+/* mm/fadvise.c */
+extern int vfs_fadvise(struct file *file, loff_t offset, loff_t len,
+		       int advice);
 
 #endif /* _LINUX_FS_H */

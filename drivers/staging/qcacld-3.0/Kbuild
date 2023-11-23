@@ -2302,9 +2302,6 @@ endif
 
 ccflags-y += $(INCS)
 
-# LTO does way too much here
-ccflags-y += $(DISABLE_LTO)
-
 cppflags-y +=	-DANI_OS_TYPE_ANDROID=6 \
 		-Wall\
 		-D__linux__
@@ -2426,7 +2423,9 @@ cppflags-$(CONFIG_FEATURE_PKTLOG) +=     -DFEATURE_PKTLOG
 
 ifeq ($(CONFIG_WLAN_NAPI), y)
 cppflags-y += -DFEATURE_NAPI
-#cppflags-y += -DHIF_IRQ_AFFINITY
+ifneq ($(CONFIG_IRQ_SBALANCE), y)
+cppflags-y += -DHIF_IRQ_AFFINITY
+endif
 ifeq ($(CONFIG_WLAN_NAPI_DEBUG), y)
 cppflags-y += -DFEATURE_NAPI_DEBUG
 endif
@@ -3341,7 +3340,6 @@ ccflags-y += -Wframe-larger-than=4096
 endif
 endif
 ccflags-y += -Wmissing-prototypes
-ccflags-$(CONFIG_ARCH_HAS_VLA_CHECKS) += $(call cc-disable-warning, vla)
 
 ifeq ($(call cc-option-yn, -Wheader-guard), y)
 ccflags-y += -Wheader-guard

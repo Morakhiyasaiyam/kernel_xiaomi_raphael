@@ -54,6 +54,7 @@
 #include <linux/vmalloc.h>
 #include <linux/preempt.h>
 #include <linux/spinlock.h>
+#include <linux/shrinker.h>
 #include <linux/types.h>
 #include <linux/debugfs.h>
 #include <linux/zsmalloc.h>
@@ -62,6 +63,7 @@
 #include <linux/migrate.h>
 #include <linux/wait.h>
 #include <linux/pagemap.h>
+#include <linux/fs.h>
 
 #define ZSPAGE_MAGIC	0x58
 
@@ -77,14 +79,18 @@
  * A single 'zspage' is composed of up to 2^N discontiguous 0-order (single)
  * pages. ZS_MAX_ZSPAGE_ORDER defines upper limit on N.
  */
+#ifdef CONFIG_OPLUS_MM_HACKS
+#define ZS_MAX_ZSPAGE_ORDER 3
+#else
 #define ZS_MAX_ZSPAGE_ORDER 2
+#endif /* CONFIG_OPLUS_MM_HACKS */
 #define ZS_MAX_PAGES_PER_ZSPAGE (_AC(1, UL) << ZS_MAX_ZSPAGE_ORDER)
 
 #define ZS_HANDLE_SIZE (sizeof(unsigned long))
 
 /*
  * Object location (<PFN>, <obj_idx>) is encoded as
- * as single (unsigned long) handle value.
+ * a single (unsigned long) handle value.
  *
  * Note that object index <obj_idx> starts from 0.
  *
@@ -120,7 +126,11 @@
 #define HUGE_BITS	1
 #define FULLNESS_BITS	2
 #define CLASS_BITS	8
+#ifdef CONFIG_OPLUS_MM_HACKS
+#define ISOLATED_BITS	(ZS_MAX_ZSPAGE_ORDER+1)
+#else
 #define ISOLATED_BITS	3
+#endif /* CONFIG_OPLUS_MM_HACKS */
 #define MAGIC_VAL_BITS	8
 
 #define MAX(a, b) ((a) >= (b) ? (a) : (b))
@@ -203,11 +213,11 @@ struct size_class {
 	 */
 	int size;
 	int objs_per_zspage;
-	/* Number of PAGE_SIZE sized pages to combine to form a 'zspage' */
-	int pages_per_zspage;
 
 	unsigned int index;
 	struct zs_size_stat stats;
+	/* Number of PAGE_SIZE sized pages to combine to form a 'zspage' */
+	int pages_per_zspage;
 };
 
 /*
@@ -243,11 +253,7 @@ struct zs_pool {
 
 	/* Compact classes */
 	struct shrinker shrinker;
-	/*
-	 * To signify that register_shrinker() was successful
-	 * and unregister_shrinker() will not Oops.
-	 */
-	bool shrinker_enabled;
+
 #ifdef CONFIG_ZSMALLOC_STAT
 	struct dentry *stat_dentry;
 #endif
@@ -277,11 +283,7 @@ struct zspage {
 };
 
 struct mapping_area {
-#ifdef CONFIG_PGTABLE_MAPPING
-	struct vm_struct *vm; /* vm area for mapping object that span pages */
-#else
 	char *vm_buf; /* copy buffer for objects that span pages */
-#endif
 	char *vm_addr; /* address of kmap_atomic()'ed pages */
 	enum zs_mapmode vm_mm; /* mapping mode */
 };
@@ -360,8 +362,8 @@ static void cache_free_handle(struct zs_pool *pool, unsigned long handle)
 
 static struct zspage *cache_alloc_zspage(struct zs_pool *pool, gfp_t flags)
 {
-	return kmem_cache_alloc(pool->zspage_cachep,
-			flags & ~(__GFP_HIGHMEM|__GFP_MOVABLE|__GFP_CMA));
+	return kmem_cache_zalloc(pool->zspage_cachep,
+			flags & ~(__GFP_HIGHMEM|__GFP_MOVABLE));
 }
 
 static void cache_free_zspage(struct zs_pool *pool, struct zspage *zspage)
@@ -425,7 +427,7 @@ static void *zs_zpool_map(void *pool, unsigned long handle,
 	case ZPOOL_MM_WO:
 		zs_mm = ZS_MM_WO;
 		break;
-	case ZPOOL_MM_RW: /* fallthru */
+	case ZPOOL_MM_RW: /* fall through */
 	default:
 		zs_mm = ZS_MM_RW;
 		break;
@@ -438,6 +440,19 @@ static void zs_zpool_unmap(void *pool, unsigned long handle)
 	zs_unmap_object(pool, handle);
 }
 
+static unsigned long zs_zpool_compact(void *pool)
+{
+	return zs_compact(pool);
+}
+
+static unsigned long zs_zpool_get_compacted(void *pool)
+{
+	struct zs_pool_stats stats;
+
+	zs_pool_stats(pool, &stats);
+	return atomic_long_read(&stats.pages_compacted);
+}
+
 static u64 zs_zpool_total_size(void *pool)
 {
 	return zs_get_total_pages(pool) << PAGE_SHIFT;
@@ -448,11 +463,14 @@ static struct zpool_driver zs_zpool_driver = {
 	.owner =	THIS_MODULE,
 	.create =	zs_zpool_create,
 	.destroy =	zs_zpool_destroy,
+	.malloc_support_movable = true,
 	.malloc =	zs_zpool_malloc,
 	.free =		zs_zpool_free,
 	.shrink =	zs_zpool_shrink,
 	.map =		zs_zpool_map,
 	.unmap =	zs_zpool_unmap,
+	.compact =	zs_zpool_compact,
+	.get_num_compacted =	zs_zpool_get_compacted,
 	.total_size =	zs_zpool_total_size,
 };
 
@@ -667,8 +685,6 @@ static const struct file_operations zs_stat_size_ops = {
 
 static void zs_pool_stat_create(struct zs_pool *pool, const char *name)
 {
-	struct dentry *entry;
-
 	if (!zs_stat_root) {
 		pr_warn("no root stat dir, not creating <%s> stat dir\n", name);
 		return;
@@ -762,13 +778,10 @@ static void insert_zspage(struct size_class *class,
 	 * We want to see more ZS_FULL pages and less almost empty/full.
 	 * Put pages with higher ->inuse first.
 	 */
-	if (head) {
-		if (get_zspage_inuse(zspage) < get_zspage_inuse(head)) {
-			list_add(&zspage->list, &head->list);
-			return;
-		}
-	}
-	list_add(&zspage->list, &class->fullness_list[fullness]);
+	if (head && get_zspage_inuse(zspage) < get_zspage_inuse(head))
+		list_add(&zspage->list, &head->list);
+	else
+		list_add(&zspage->list, &class->fullness_list[fullness]);
 }
 
 /*
@@ -850,7 +863,7 @@ static int get_pages_per_zspage(int class_size)
 
 static struct zspage *get_zspage(struct page *page)
 {
-	struct zspage *zspage = (struct zspage *)page->private;
+	struct zspage *zspage = (struct zspage *)page_private(page);
 
 	BUG_ON(zspage->magic != ZSPAGE_MAGIC);
 	return zspage;
@@ -868,6 +881,7 @@ static struct page *get_next_page(struct page *page)
 
 /**
  * obj_to_location - get (<page>, <obj_idx>) from encoded object value
+ * @obj: the encoded object value
  * @page: page object resides in zspage
  * @obj_idx: object index
  */
@@ -1083,7 +1097,7 @@ static void init_zspage(struct size_class *class, struct zspage *zspage)
 			 * Reset OBJ_TAG_BITS bit to last link to tell
 			 * whether it's allocated object or not.
 			 */
-			link->next = -1 << OBJ_TAG_BITS;
+			link->next = -1UL << OBJ_TAG_BITS;
 		}
 		kunmap_atomic(vaddr);
 		page = next_page;
@@ -1140,7 +1154,6 @@ static struct zspage *alloc_zspage(struct zs_pool *pool,
 	if (unlikely(!zspage))
 		return NULL;
 
-	memset(zspage, 0, sizeof(struct zspage));
 	zspage->magic = ZSPAGE_MAGIC;
 	migrate_lock_init(zspage);
 
@@ -1181,46 +1194,6 @@ static struct zspage *find_get_zspage(struct size_class *class)
 
 	return zspage;
 }
-
-#ifdef CONFIG_PGTABLE_MAPPING
-static inline int __zs_cpu_up(struct mapping_area *area)
-{
-	/*
-	 * Make sure we don't leak memory if a cpu UP notification
-	 * and zs_init() race and both call zs_cpu_up() on the same cpu
-	 */
-	if (area->vm)
-		return 0;
-	area->vm = alloc_vm_area(PAGE_SIZE * 2, NULL);
-	if (!area->vm)
-		return -ENOMEM;
-	return 0;
-}
-
-static inline void __zs_cpu_down(struct mapping_area *area)
-{
-	if (area->vm)
-		free_vm_area(area->vm);
-	area->vm = NULL;
-}
-
-static inline void *__zs_map_object(struct mapping_area *area,
-				struct page *pages[2], int off, int size)
-{
-	BUG_ON(map_vm_area(area->vm, PAGE_KERNEL, pages));
-	area->vm_addr = area->vm->addr;
-	return area->vm_addr + off;
-}
-
-static inline void __zs_unmap_object(struct mapping_area *area,
-				struct page *pages[2], int off, int size)
-{
-	unsigned long addr = (unsigned long)area->vm_addr;
-
-	unmap_kernel_range(addr, PAGE_SIZE * 2);
-}
-
-#else /* CONFIG_PGTABLE_MAPPING */
 
 static inline int __zs_cpu_up(struct mapping_area *area)
 {
@@ -1302,8 +1275,6 @@ out:
 	pagefault_enable();
 }
 
-#endif /* CONFIG_PGTABLE_MAPPING */
-
 static int zs_cpu_prepare(unsigned int cpu)
 {
 	struct mapping_area *area;
@@ -1346,6 +1317,7 @@ EXPORT_SYMBOL_GPL(zs_get_total_pages);
  * zs_map_object - get address of allocated object from handle.
  * @pool: pool from which the object was allocated
  * @handle: handle returned from zs_malloc
+ * @mm: maping mode to use
  *
  * Before using an object allocated from zs_malloc, it must be mapped using
  * this function. When done with the object, it must be unmapped using
@@ -1836,11 +1808,7 @@ static enum fullness_group putback_zspage(struct size_class *class,
 static struct dentry *zs_mount(struct file_system_type *fs_type,
 				int flags, const char *dev_name, void *data)
 {
-	static const struct dentry_operations ops = {
-		.d_dname = simple_dname,
-	};
-
-	return mount_pseudo(fs_type, "zsmalloc:", NULL, &ops, ZSMALLOC_MAGIC);
+	return mount_pseudo(fs_type, "zsmalloc:", NULL, NULL, ZSMALLOC_MAGIC);
 }
 
 static struct file_system_type zsmalloc_fs = {
@@ -2286,10 +2254,7 @@ static unsigned long zs_shrinker_count(struct shrinker *shrinker,
 
 static void zs_unregister_shrinker(struct zs_pool *pool)
 {
-	if (pool->shrinker_enabled) {
-		unregister_shrinker(&pool->shrinker);
-		pool->shrinker_enabled = false;
-	}
+	unregister_shrinker(&pool->shrinker);
 }
 
 static int zs_register_shrinker(struct zs_pool *pool)
@@ -2410,11 +2375,13 @@ struct zs_pool *zs_create_pool(const char *name)
 		goto err;
 
 	/*
-	 * Not critical, we still can use the pool
-	 * and user can trigger compaction manually.
+	 * Not critical since shrinker is only used to trigger internal
+	 * defragmentation of the pool which is pretty optional thing.  If
+	 * registration fails we still can use the pool normally and user can
+	 * trigger compaction manually. Thus, ignore return code.
 	 */
-	if (zs_register_shrinker(pool) == 0)
-		pool->shrinker_enabled = true;
+	zs_register_shrinker(pool);
+
 	return pool;
 
 err:

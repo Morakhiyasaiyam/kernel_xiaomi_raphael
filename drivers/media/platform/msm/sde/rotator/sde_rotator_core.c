@@ -2851,7 +2851,7 @@ static int sde_rotator_get_dt_vreg_data(struct device *dev,
 	struct device_node *of_node = NULL;
 	int dt_vreg_total = 0;
 	int i;
-	int rc = 0;
+	int rc;
 
 	if (!dev || !mp) {
 		SDEROT_ERR("%s: invalid input\n", __func__);
@@ -2895,7 +2895,7 @@ static int sde_rotator_get_dt_vreg_data(struct device *dev,
 			mp->vreg_config[i].enable_load,
 			mp->vreg_config[i].disable_load);
 	}
-	return rc;
+	return 0;
 
 error:
 	if (mp->vreg_config) {

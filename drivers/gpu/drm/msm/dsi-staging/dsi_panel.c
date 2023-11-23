@@ -2318,7 +2318,8 @@ static int dsi_panel_parse_misc_features(struct dsi_panel *panel)
 	pr_info("%s: ulps feature %s\n", __func__,
 		(panel->ulps_feature_enabled ? "enabled" : "disabled"));
 
-	panel->ulps_suspend_enabled = true;
+	panel->ulps_suspend_enabled =
+		utils->read_bool(utils->data, "qcom,suspend-ulps-enabled");
 
 	pr_info("%s: ulps during suspend feature %s", __func__,
 		(panel->ulps_suspend_enabled ? "enabled" : "disabled"));
@@ -2708,6 +2709,24 @@ static int dsi_panel_parse_bl_config(struct dsi_panel *panel)
 
 	panel->bl_config.bl_inverted_dbv = utils->read_bool(utils->data,
 		"qcom,mdss-dsi-bl-inverted-dbv");
+
+	rc = utils->read_u32(utils->data,
+			"qcom,disp-doze-lpm-backlight", &val);
+	if (rc) {
+		panel->bl_config.bl_doze_lpm = 0;
+		pr_debug("set doze lpm backlight to 0\n");
+	} else {
+		panel->bl_config.bl_doze_lpm = val;
+	}
+
+	rc = utils->read_u32(utils->data,
+			"qcom,disp-doze-hbm-backlight", &val);
+	if (rc) {
+		panel->bl_config.bl_doze_hbm = 0;
+		pr_debug("set doze hbm backlight to 0\n");
+	} else {
+		panel->bl_config.bl_doze_hbm = val;
+	}
 
 	rc = dsi_panel_parse_fod_dim_lut(panel, utils);
 	if (rc)
@@ -4557,7 +4576,6 @@ int dsi_panel_set_lp1(struct dsi_panel *panel)
 	if (rc)
 		pr_debug("[%s] failed to send DSI_CMD_SET_LP1 cmd, rc=%d\n",
 		       panel->name, rc);
-
 exit:
 	mutex_unlock(&panel->panel_lock);
 	return rc;
@@ -4580,7 +4598,6 @@ int dsi_panel_set_lp2(struct dsi_panel *panel)
 	if (rc)
 		pr_debug("[%s] failed to send DSI_CMD_SET_LP2 cmd, rc=%d\n",
 		       panel->name, rc);
-
 exit:
 	mutex_unlock(&panel->panel_lock);
 	return rc;
@@ -4611,7 +4628,6 @@ int dsi_panel_set_nolp(struct dsi_panel *panel)
 	if (rc)
 		pr_debug("[%s] failed to send DSI_CMD_SET_NOLP cmd, rc=%d\n",
 		       panel->name, rc);
-
 exit:
 	mutex_unlock(&panel->panel_lock);
 	return rc;
@@ -4625,6 +4641,7 @@ int dsi_panel_prepare(struct dsi_panel *panel)
 		pr_debug("invalid params\n");
 		return -EINVAL;
 	}
+
 	mutex_lock(&panel->panel_lock);
 
 	if (panel->init_delay_us)
@@ -4950,7 +4967,7 @@ int dsi_panel_enable(struct dsi_panel *panel)
 		panel->panel_initialized = true;
 	mutex_unlock(&panel->panel_lock);
 
-	if (panel->hbm_mode)
+  if (panel->hbm_mode)
 		dsi_panel_apply_hbm_mode(panel);
 
 	return rc;

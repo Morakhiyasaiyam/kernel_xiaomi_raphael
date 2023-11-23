@@ -108,7 +108,7 @@ int idr_alloc_cmn(struct idr *idr, void *ptr, unsigned long *index,
 static inline int idr_alloc(struct idr *idr, void *ptr,
 			    int start, int end, gfp_t gfp)
 {
-	unsigned long id = 0;
+	unsigned long id;
 	int ret;
 
 	if (WARN_ON_ONCE(start < 0))

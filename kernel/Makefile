@@ -40,9 +40,6 @@ ccflags-y += -mllvm -inlinehint-threshold=10000
 # Don't instrument error handlers
 CFLAGS_cfi.o = $(DISABLE_CFI_CLANG)
 
-ccflags-y += -mllvm -inline-threshold=15000
-ccflags-y += -mllvm -inlinehint-threshold=10000
-
 obj-y += sched/
 obj-y += locking/
 obj-y += power/

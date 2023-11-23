@@ -375,13 +375,13 @@ int dsi_panel_parse_esd_reg_read_configs(struct dsi_panel *panel);
 
 void dsi_panel_ext_bridge_put(struct dsi_panel *panel);
 
+void dsi_panel_calc_dsi_transfer_time(struct dsi_host_common_cfg *config,
+		struct dsi_display_mode *mode, u32 frame_threshold_us);
+
 u8 dsi_panel_get_fod_dim_alpha(struct dsi_panel *panel);
 u8 dsi_panel_get_dc_dim_alpha(struct dsi_panel *panel);
 
 int dsi_panel_apply_hbm_mode(struct dsi_panel *panel);
-
-void dsi_panel_calc_dsi_transfer_time(struct dsi_host_common_cfg *config,
-		struct dsi_display_mode *mode, u32 frame_threshold_us);
 
 int dsi_panel_set_fod_hbm(struct dsi_panel *panel, bool status);
 bool dsi_panel_get_fod_ui(struct dsi_panel *panel);

@@ -9,10 +9,6 @@
  * most "normal" filesystems (but you don't /have/ to use this:
  * the NFS filesystem used to do this differently, for example)
  */
-#ifdef CONFIG_MINIMAL_TRACING_FOR_IORAP
-#undef NOTRACE
-#endif
-
 #include <linux/export.h>
 #include <linux/compiler.h>
 #include <linux/dax.h>
@@ -39,6 +35,7 @@
 #include <linux/hugetlb.h>
 #include <linux/memcontrol.h>
 #include <linux/cleancache.h>
+#include <linux/shmem_fs.h>
 #include <linux/rmap.h>
 #include <linux/delayacct.h>
 #include <linux/psi.h>
@@ -142,7 +139,7 @@ static int page_cache_tree_insert(struct address_space *mapping,
 			*shadowp = p;
 	}
 	__radix_tree_replace(&mapping->page_tree, node, slot, page,
-			     workingset_update_node, mapping);
+			     workingset_lookup_update(mapping));
 	mapping->nrpages++;
 	return 0;
 }
@@ -170,7 +167,7 @@ static void page_cache_tree_delete(struct address_space *mapping,
 
 		radix_tree_clear_tags(&mapping->page_tree, node, slot);
 		__radix_tree_replace(&mapping->page_tree, node, slot, shadow,
-				     workingset_update_node, mapping);
+				workingset_lookup_update(mapping));
 	}
 
 	if (shadow) {
@@ -1001,7 +998,7 @@ static void wake_up_page(struct page *page, int bit)
 	wake_up_page_bit(page, bit);
 }
 
-static inline __sched int wait_on_page_bit_common(wait_queue_head_t *q,
+static inline int wait_on_page_bit_common(wait_queue_head_t *q,
 		struct page *page, int bit_nr, int state, bool lock)
 {
 	struct wait_page_queue wait_page;
@@ -1073,14 +1070,14 @@ static inline __sched int wait_on_page_bit_common(wait_queue_head_t *q,
 	return ret;
 }
 
-void __sched wait_on_page_bit(struct page *page, int bit_nr)
+void wait_on_page_bit(struct page *page, int bit_nr)
 {
 	wait_queue_head_t *q = page_waitqueue(page);
 	wait_on_page_bit_common(q, page, bit_nr, TASK_UNINTERRUPTIBLE, false);
 }
 EXPORT_SYMBOL(wait_on_page_bit);
 
-int __sched wait_on_page_bit_killable(struct page *page, int bit_nr)
+int wait_on_page_bit_killable(struct page *page, int bit_nr)
 {
 	wait_queue_head_t *q = page_waitqueue(page);
 	return wait_on_page_bit_common(q, page, bit_nr, TASK_KILLABLE, false);
@@ -1171,11 +1168,19 @@ void end_page_writeback(struct page *page)
 		rotate_reclaimable_page(page);
 	}
 
+	/*
+	 * Writeback does not hold a page reference of its own, relying
+	 * on truncation to wait for the clearing of PG_writeback.
+	 * But here we must make sure that the page is not freed and
+	 * reused before the wake_up_page().
+	 */
+	get_page(page);
 	if (!test_clear_page_writeback(page))
 		BUG();
 
 	smp_mb__after_atomic();
 	wake_up_page(page, PG_writeback);
+	put_page(page);
 }
 EXPORT_SYMBOL(end_page_writeback);
 
@@ -1211,7 +1216,7 @@ EXPORT_SYMBOL_GPL(page_endio);
  * __lock_page - get a lock on the page, assuming we need to sleep to get it
  * @__page: the page to lock
  */
-void __sched __lock_page(struct page *__page)
+void __lock_page(struct page *__page)
 {
 	struct page *page = compound_head(__page);
 	wait_queue_head_t *q = page_waitqueue(page);
@@ -1219,7 +1224,7 @@ void __sched __lock_page(struct page *__page)
 }
 EXPORT_SYMBOL(__lock_page);
 
-int __sched __lock_page_killable(struct page *__page)
+int __lock_page_killable(struct page *__page)
 {
 	struct page *page = compound_head(__page);
 	wait_queue_head_t *q = page_waitqueue(page);
@@ -1238,7 +1243,7 @@ EXPORT_SYMBOL_GPL(__lock_page_killable);
  * If neither ALLOW_RETRY nor KILLABLE are set, will always return 1
  * with the page locked and the mmap_sem unperturbed.
  */
-int __sched __lock_page_or_retry(struct page *page, struct mm_struct *mm,
+int __lock_page_or_retry(struct page *page, struct mm_struct *mm,
 			 unsigned int flags)
 {
 	if (flags & FAULT_FLAG_ALLOW_RETRY) {

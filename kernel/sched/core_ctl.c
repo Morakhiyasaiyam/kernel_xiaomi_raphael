@@ -1,13 +1,6 @@
-/* Copyright (c) 2014-2018, 2020, The Linux Foundation. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 and
- * only version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Copyright (c) 2014-2020, The Linux Foundation. All rights reserved.
  */
 
 #define pr_fmt(fmt)	"core_ctl: " fmt
@@ -23,13 +16,10 @@
 #include <uapi/linux/sched/types.h>
 #include <linux/sched/core_ctl.h>
 
-#include <trace/events/sched.h>
 #include "sched.h"
 #include "walt.h"
 
-#define MAX_CPUS_PER_CLUSTER 6
-#define MAX_CLUSTERS 3
-
+#define MAX_NR_HISTORY_COUNT	2
 struct cluster_data {
 	bool inited;
 	unsigned int min_cpus;
@@ -45,6 +35,8 @@ struct cluster_data {
 	unsigned int need_cpus;
 	unsigned int task_thres;
 	unsigned int max_nr;
+	unsigned int max_nr_avg;
+	unsigned int max_nr_history[MAX_NR_HISTORY_COUNT];
 	unsigned int nr_prev_assist;
 	unsigned int nr_prev_assist_thresh;
 	s64 need_ts;
@@ -57,6 +49,7 @@ struct cluster_data {
 	unsigned int first_cpu;
 	unsigned int boost;
 	struct kobject kobj;
+	unsigned int strict_nrrun;
 };
 
 struct cpu_data {
@@ -86,7 +79,6 @@ ATOMIC_NOTIFIER_HEAD(core_ctl_notifier);
 static unsigned int last_nr_big;
 
 static unsigned int get_active_cpu_count(const struct cluster_data *cluster);
-static void cpuset_next(struct cluster_data *cluster);
 
 /* ========================= sysfs interface =========================== */
 
@@ -99,7 +91,6 @@ static ssize_t store_min_cpus(struct cluster_data *state,
 		return -EINVAL;
 
 	state->min_cpus = min(val, state->max_cpus);
-	cpuset_next(state);
 	wake_up_core_ctl_thread(state);
 
 	return count;
@@ -121,7 +112,6 @@ static ssize_t store_max_cpus(struct cluster_data *state,
 	val = min(val, state->num_cpus);
 	state->max_cpus = val;
 	state->min_cpus = min(state->min_cpus, state->max_cpus);
-	cpuset_next(state);
 	wake_up_core_ctl_thread(state);
 
 	return count;
@@ -352,7 +342,7 @@ static ssize_t store_not_preferred(struct cluster_data *state,
 				   const char *buf, size_t count)
 {
 	struct cpu_data *c;
-	unsigned int i;
+	unsigned int i, mask;
 	unsigned int val[MAX_CPUS_PER_CLUSTER];
 	unsigned long flags;
 	int ret;
@@ -365,10 +355,16 @@ static ssize_t store_not_preferred(struct cluster_data *state,
 		return -EINVAL;
 
 	spin_lock_irqsave(&state_lock, flags);
-	for (i = 0; i < state->num_cpus; i++) {
-		c = &per_cpu(cpu_state, i + state->first_cpu);
+	for (i = 0, mask = 0; i < state->num_cpus;) {
+		if (!cpumask_test_cpu(i + mask + state->first_cpu, cpu_possible_mask)) {
+			mask++;
+			continue;
+		}
+
+		c = &per_cpu(cpu_state, i + mask + state->first_cpu);
 		c->not_preferred = val[i];
 		not_preferred_count += !!val[i];
+		i++;
 	}
 	state->nr_not_preferred_cpus = not_preferred_count;
 	spin_unlock_irqrestore(&state_lock, flags);
@@ -381,19 +377,25 @@ static ssize_t show_not_preferred(const struct cluster_data *state, char *buf)
 	struct cpu_data *c;
 	ssize_t count = 0;
 	unsigned long flags;
-	int i;
+	int i, mask;
 
 	spin_lock_irqsave(&state_lock, flags);
-	for (i = 0; i < state->num_cpus; i++) {
-		c = &per_cpu(cpu_state, i + state->first_cpu);
+	for (i = 0, mask = 0; i < state->num_cpus;) {
+		if (!cpumask_test_cpu(i + mask + state->first_cpu, cpu_possible_mask)) {
+			mask++;
+			continue;
+		}
+
+		c = &per_cpu(cpu_state, i + mask + state->first_cpu);
 		count += scnprintf(buf + count, PAGE_SIZE - count,
-				"CPU#%d: %u\n", c->cpu, c->not_preferred);
+			"CPU#%d: %u\n", c->cpu, c->not_preferred);
+		i++;
 	}
+
 	spin_unlock_irqrestore(&state_lock, flags);
 
 	return count;
 }
-
 
 struct core_ctl_attr {
 	struct attribute attr;
@@ -560,6 +562,23 @@ static int compute_cluster_max_nr(int index)
 	return max_nr;
 }
 
+static int compute_cluster_average_max_nr(int index, unsigned int max_nr)
+{
+	struct cluster_data *cluster = &cluster_state[index];
+	u32 *hist = &cluster->max_nr_history[0];
+	int idx, sum = 0;
+
+	for (idx = MAX_NR_HISTORY_COUNT - 1; idx > 0; idx--) {
+		hist[idx] = hist[idx-1];
+		sum += hist[idx];
+	}
+
+	hist[0] = max_nr;
+	sum += hist[0];
+
+	return DIV_ROUND_UP(sum, MAX_NR_HISTORY_COUNT);
+}
+
 static int cluster_real_big_tasks(int index)
 {
 	int nr_big = 0;
@@ -631,6 +650,49 @@ static int prev_cluster_nr_need_assist(int index)
 	return need;
 }
 
+/*
+ * This is only implemented for min capacity cluster.
+ *
+ * Bringing a little CPU out of isolation and using it
+ * more does not hurt power as much as bringing big CPUs.
+ *
+ * little cluster provides help needed for the other clusters.
+ * we take nr_scaled (which gives better resolution) and find
+ * the total nr in the system. Then take out the active higher
+ * capacity CPUs from the nr and consider the remaining nr as
+ * strict and consider that many little CPUs are needed.
+ */
+static int compute_cluster_nr_strict_need(int index)
+{
+	int cpu;
+	struct cluster_data *cluster;
+	int nr_strict_need = 0;
+
+	if (index != 0)
+		return 0;
+
+	for_each_cluster(cluster, index) {
+		int nr_scaled = 0;
+		int active_cpus = cluster->active_cpus;
+
+		for_each_cpu(cpu, &cluster->cpu_mask)
+			nr_scaled += nr_stats[cpu].nr_scaled;
+
+		nr_scaled /= 100;
+
+		/*
+		 * For little cluster, nr_scaled becomes the nr_strict,
+		 * for other cluster, overflow is counted towards
+		 * the little cluster need.
+		 */
+		if (index == 0)
+			nr_strict_need += nr_scaled;
+		else
+			nr_strict_need += max(0, nr_scaled - active_cpus);
+	}
+
+	return nr_strict_need;
+}
 static void update_running_avg(void)
 {
 	struct cluster_data *cluster;
@@ -653,12 +715,10 @@ static void update_running_avg(void)
 
 		cluster->nrrun = nr_need + prev_misfit_need;
 		cluster->max_nr = compute_cluster_max_nr(index);
+		cluster->max_nr_avg = compute_cluster_average_max_nr(index, cluster->max_nr);
 		cluster->nr_prev_assist = prev_cluster_nr_need_assist(index);
 
-		trace_core_ctl_update_nr_need(cluster->first_cpu, nr_need,
-					prev_misfit_need,
-					cluster->nrrun, cluster->max_nr,
-					cluster->nr_prev_assist);
+		cluster->strict_nrrun = compute_cluster_nr_strict_need(index);
 
 		big_avg += cluster_real_big_tasks(index);
 	}
@@ -693,8 +753,17 @@ static unsigned int apply_task_need(const struct cluster_data *cluster,
 	 * If any CPU has more than MAX_NR_THRESHOLD in the last
 	 * window, bring another CPU to help out.
 	 */
-	if (cluster->max_nr > MAX_NR_THRESHOLD)
+	if (cluster->max_nr > MAX_NR_THRESHOLD &&
+	    cluster->max_nr_avg > MAX_NR_THRESHOLD)
 		new_need = new_need + 1;
+
+	/*
+	 * For little cluster, we use a bit more relaxed approach
+	 * and impose the strict nr condition. Because all tasks can
+	 * spill onto little if big cluster is crowded.
+	 */
+	if (new_need < cluster->strict_nrrun)
+		new_need = cluster->strict_nrrun;
 
 	return new_need;
 }
@@ -725,6 +794,13 @@ static bool adjustment_possible(const struct cluster_data *cluster,
 						cluster->nr_isolated_cpus));
 }
 
+static bool need_all_cpus(const struct cluster_data *cluster)
+{
+
+	return (is_min_capacity_cpu(cluster->first_cpu) &&
+		sched_ravg_window < DEFAULT_SCHED_RAVG_WINDOW);
+}
+
 static bool eval_need(struct cluster_data *cluster)
 {
 	unsigned long flags;
@@ -740,7 +816,7 @@ static bool eval_need(struct cluster_data *cluster)
 
 	spin_lock_irqsave(&state_lock, flags);
 
-	if (cluster->boost || !cluster->enable) {
+	if (cluster->boost || !cluster->enable || need_all_cpus(cluster)) {
 		need_cpus = cluster->max_cpus;
 	} else {
 		cluster->active_cpus = get_active_cpu_count(cluster);
@@ -754,8 +830,6 @@ static bool eval_need(struct cluster_data *cluster)
 			else if (c->busy < cluster->busy_down_thres[thres_idx])
 				c->is_busy = false;
 
-			trace_core_ctl_set_busy(c->cpu, c->busy, old_is_busy,
-						c->is_busy);
 			need_cpus += c->is_busy;
 		}
 		need_cpus = apply_task_need(cluster, need_cpus);
@@ -788,8 +862,6 @@ static bool eval_need(struct cluster_data *cluster)
 		cluster->need_ts = now;
 		cluster->need_cpus = new_need;
 	}
-	trace_core_ctl_eval_need(cluster->first_cpu, last_need, new_need,
-				 ret && need_flag);
 	spin_unlock_irqrestore(&state_lock, flags);
 
 	return ret && need_flag;
@@ -850,9 +922,6 @@ int core_ctl_set_boost(bool boost)
 			apply_need(cluster);
 	}
 
-	if (cluster)
-		trace_core_ctl_set_boost(cluster->boost, ret);
-
 	return ret;
 }
 EXPORT_SYMBOL(core_ctl_set_boost);
@@ -869,7 +938,7 @@ void core_ctl_notifier_unregister(struct notifier_block *n)
 
 static void core_ctl_call_notifier(void)
 {
-	struct core_ctl_notif_data ndata;
+	struct core_ctl_notif_data ndata = {0};
 	struct notifier_block *nb;
 
 	/*
@@ -884,7 +953,7 @@ static void core_ctl_call_notifier(void)
 		return;
 
 	ndata.nr_big = last_nr_big;
-	ndata.coloc_load_pct = walt_get_default_coloc_group_load();
+	walt_fill_ta_data(&ndata);
 
 	atomic_notifier_call_chain(&core_ctl_notifier, 0, &ndata);
 }
@@ -937,8 +1006,6 @@ static void move_cpu_lru(struct cpu_data *cpu_data)
 	list_add_tail(&cpu_data->sib, &cpu_data->cluster->lru);
 	spin_unlock_irqrestore(&state_lock, flags);
 }
-
-static void cpuset_next(struct cluster_data *cluster) { }
 
 static bool should_we_isolate(int cpu, struct cluster_data *cluster)
 {
@@ -1254,6 +1321,7 @@ static int cluster_init(const struct cpumask *mask)
 	cluster->nrrun = cluster->num_cpus;
 	cluster->enable = true;
 	cluster->nr_not_preferred_cpus = 0;
+	cluster->strict_nrrun = 0;
 	INIT_LIST_HEAD(&cluster->lru);
 	spin_lock_init(&cluster->pending_lock);
 

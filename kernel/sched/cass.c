@@ -25,6 +25,17 @@
  * satisfy the overall load at any given moment.
  */
 
+/*
+ * Remove and clamp on negative, from a local variable.
+ *
+ * A variant of sub_positive(), which does not use explicit load-store
+ * and is thus optimized for local variable updates.
+ */
+#define lsub_positive(_ptr, _val) do {				\
+	typeof(_ptr) ptr = (_ptr);				\
+	*ptr -= min_t(typeof(*ptr), *ptr, _val);		\
+} while (0)
+
 struct cass_cpu_cand {
 	int cpu;
 	unsigned int exit_lat;
@@ -101,17 +112,14 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync)
 	int cidx = 0, cpu;
 
 	/* Get the utilization for this task */
-	p_util = clamp(task_util_est(p),
-		       uclamp_eff_value(p, UCLAMP_MIN),
-		       uclamp_eff_value(p, UCLAMP_MAX));
+	p_util = boosted_task_util(p);
 
 	/*
-	 * Find the best CPU to wake @p on. Although idle_get_state() requires
-	 * an RCU read lock, an RCU read lock isn't needed because we're not
-	 * preemptible and RCU-sched is unified with normal RCU. Therefore,
-	 * non-preemptible contexts are implicitly RCU-safe.
+	 * Find the best CPU to wake @p on. The RCU read lock is needed for
+	 * idle_get_state().
 	 */
-	for_each_cpu_and(cpu, p->cpus_ptr, cpu_active_mask) {
+	rcu_read_lock();
+	for_each_cpu_and(cpu, &p->cpus_allowed, cpu_active_mask) {
 		/* Use the free candidate slot */
 		curr = &cands[cidx];
 		curr->cpu = cpu;
@@ -175,12 +183,14 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync)
 			cidx ^= 1;
 		}
 	}
+	rcu_read_unlock();
 
 	return best->cpu;
 }
 
 static int cass_select_task_rq_fair(struct task_struct *p, int prev_cpu,
-				    int sd_flag, int wake_flags)
+				    int sd_flag, int wake_flags,
+				    int sibling_count_hint)
 {
 	bool sync;
 
@@ -193,8 +203,8 @@ static int cass_select_task_rq_fair(struct task_struct *p, int prev_cpu,
 	 * first valid CPU since it's possible for certain types of tasks to run
 	 * on inactive CPUs.
 	 */
-	if (unlikely(!cpumask_intersects(p->cpus_ptr, cpu_active_mask)))
-		return cpumask_first(p->cpus_ptr);
+	if (unlikely(!cpumask_intersects(&p->cpus_allowed, cpu_active_mask)))
+		return cpumask_first(&p->cpus_allowed);
 
 	/* cass_best_cpu() needs the task's utilization, so sync it up */
 	if (!(sd_flag & SD_BALANCE_FORK))

@@ -1261,7 +1261,8 @@ int goodix_ts_irq_setup(struct goodix_ts_core *core_data)
 			core_data->irq, NULL,
 			goodix_ts_threadirq_func,
 			ts_bdata->irq_flags | IRQF_ONESHOT,
-			GOODIX_CORE_DRIVER_NAME, core_data);
+			GOODIX_CORE_DRIVER_NAME,
+			core_data);
 	if (r < 0)
 		ts_err("Failed to requeset threaded irq:%d", r);
 	else
